@@ -13,23 +13,23 @@ const approval = (overrides = {}) => ({
   user: { login: 'reviewer', type: 'User' }, ...overrides,
 });
 
-async function check({ reviews = [], body = '', merged = false, permission = 'write', head = 'current', apiError = false } = {}) {
-  const result = { failures: [], comments: [], reads: 0 };
-  const pr = { user: { login: 'author' }, head: { sha: head }, body, merged, merged_by: { login: 'merger' }, merged_at: '2026-11-02T03:32:40Z' };
+async function check({ reviews = [], body = '', merged = false, permission = 'write', head = 'current', apiError = false, author = 'author', authorId = 1, base = 'development', merger = { login: 'merger', id: 3, type: 'User' }, permissionByUser = {} } = {}) {
+  const result = { failures: [], comments: [], reads: 0, logs: [] };
+  const pr = { user: { login: author, id: authorId, type: 'User' }, base: { ref: base }, head: { sha: head }, body, merged, merged_by: merger, merged_at: '2026-11-02T03:32:40Z' };
   const github = {
     paginate: async () => reviews,
     rest: {
       pulls: { get: async () => { result.reads++; return { data: pr }; }, listReviews() {} },
-      repos: { getCollaboratorPermissionLevel: async () => {
+      repos: { getCollaboratorPermissionLevel: async ({ username }) => {
         if (apiError) throw new Error('API unavailable');
-        return { data: { permission } };
+        return { data: { permission: permissionByUser[username] || permission } };
       } },
       issues: { createComment: async ({ body }) => result.comments.push(body) },
     },
   };
   // Payload deliberately differs from current API data, as on old review events.
   await run(github, { repo: { owner: 'GeospanAI', repo: 'team-documentation' }, payload: { pull_request: { number: 16, head: { sha: 'old' } } } }, {
-    info() {}, setFailed: message => result.failures.push(message),
+    info: message => result.logs.push(message), setFailed: message => result.failures.push(message),
   });
   return result;
 }
@@ -88,4 +88,85 @@ test('audit includes exception text without asserting approval and stops at next
 });
 test('reviewed merge does not create an exception record', async () => {
   assert.deepEqual((await check({ merged: true, reviews: [approval()] })).comments, []);
+});
+
+const revision = 'a'.repeat(40);
+const founders = [
+  { author: 'beaugeospan', authorId: 227131098, role: 'CTO' },
+  { author: 'juliageospan', authorId: 230599793, role: 'CEO' },
+];
+const record = (login, sha = revision) => `## Merge justification
+
+**Exception authorised by:** @${login}, 2026-11-03.
+**Revision:** ${sha}
+**Reason and urgency:** This critical review enforcement repair needs prompt action to prevent unapproved stacked changes entering shared development branches.
+**Alternative validation:** The regression fixtures passed locally and the required application checks must validate this exact revision before merge.
+**Risk, owner and follow-up:** The author owns rollout verification, independent oversight, Vanta evidence and a reviewed rollback if the checks expose a regression.
+`;
+for (const founder of founders) {
+  for (const base of ['development', 'Development', 'staging', 'Staging']) {
+    test(`${founder.role} revision-bound exception passes on ${base}`, async () => {
+      const result = await check({ ...founder, base, head: revision, body: record(founder.author) });
+      assert.deepEqual(result.failures, []);
+      assert.match(result.logs[0], new RegExp(`${founder.role} exception recorded`));
+    });
+  }
+  for (const base of ['production', 'Production', 'main', 'feature/parent']) {
+    test(`${founder.role} exception never passes on ${base}`, async () => {
+      assert.equal((await check({ ...founder, base, head: revision, body: record(founder.author) })).failures.length, 1);
+    });
+  }
+}
+test('another author cannot claim either founder identity in justification text', async () => {
+  assert.equal((await check({ head: revision, body: record('beaugeospan') })).failures.length, 1);
+});
+test('founder login without its verified account ID is rejected', async () => {
+  assert.equal((await check({ author: 'beaugeospan', authorId: 999, head: revision, body: record('beaugeospan') })).failures.length, 1);
+});
+test('founder ID without its configured login is rejected', async () => {
+  assert.equal((await check({ author: 'someone-else', authorId: 227131098, head: revision, body: record('someone-else') })).failures.length, 1);
+});
+for (const [label, mutate] of [
+  ['stale revision', body => body.replace(revision, 'b'.repeat(40))],
+  ['missing revision', body => body.replace(`**Revision:** ${revision}`, '')],
+  ['wrong authorising account', body => body.replace('@beaugeospan', '@juliageospan')],
+  ['missing approval date', body => body.replace('2026-11-03', '')],
+  ['missing reason', body => body.replace(/\*\*Reason and urgency:\*\*[^\n]+/, '**Reason and urgency:**')],
+  ['AI credit as reason', body => body.replace(/\*\*Reason and urgency:\*\*[^\n]+/, '**Reason and urgency:** Generated with Claude Code and nothing else is recorded here.')],
+  ['template comment as validation', body => body.replace(/\*\*Alternative validation:\*\*[^\n]+/, '**Alternative validation:** <!-- Test results should be recorded here and must refer to this revision -->')],
+  ['missing risk and owner', body => body.replace(/\*\*Risk, owner and follow-up:\*\*[^\n]+/, '')],
+]) {
+  test(`founder exception rejects ${label}`, async () => {
+    assert.equal((await check({ ...founders[0], head: revision, body: mutate(record('beaugeospan')) })).failures.length, 1);
+  });
+}
+test('founder without write permission cannot use an exception', async () => {
+  assert.equal((await check({ ...founders[0], head: revision, body: record('beaugeospan'), permission: 'read' })).failures.length, 1);
+});
+test('blocking feedback on an earlier revision prevents a founder exception', async () => {
+  const result = await check({ ...founders[0], head: revision, body: record('beaugeospan'),
+    reviews: [approval({ state: 'CHANGES_REQUESTED', commit_id: 'old' })] });
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /blocking changes requested/);
+});
+test('one approval cannot override another eligible reviewer requesting changes', async () => {
+  const result = await check({ reviews: [approval(), approval({ id: 2, state: 'CHANGES_REQUESTED', user: { login: 'another-reviewer', type: 'User' } })] });
+  assert.equal(result.failures.length, 1);
+});
+test('a read-only changes request does not override an eligible approval', async () => {
+  const result = await check({ reviews: [approval(), approval({ id: 2, state: 'CHANGES_REQUESTED', user: { login: 'reader', type: 'User' } })], permissionByUser: { reader: 'read' } });
+  assert.deepEqual(result.failures, []);
+});
+test('merged founder exception records actor, revision and target without inventing a review', async () => {
+  const result = await check({ ...founders[0], head: revision, body: record('beaugeospan'), merged: true,
+    merger: { id: 227131098, login: 'beaugeospan', type: 'User' } });
+  assert.equal(result.comments.length, 1);
+  assert.match(result.comments[0], /founder review exception record/);
+  assert.match(result.comments[0], /without a current independent human approval/);
+  assert.match(result.comments[0], new RegExp(revision));
+});
+test('an unlisted merger is not reported as a validated founder exception', async () => {
+  const result = await check({ ...founders[0], head: revision, body: record('beaugeospan'), merged: true });
+  assert.match(result.comments[0], /not verified as CTO-approved/);
+  assert.doesNotMatch(result.comments[0], /founder review exception record/);
 });
