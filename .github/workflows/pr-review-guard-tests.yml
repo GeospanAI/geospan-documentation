@@ -1,0 +1,17 @@
+name: PR review guard regression tests
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  review-guard-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: node --test tests/test_pr_review_guard.cjs

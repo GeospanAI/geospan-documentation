@@ -1,0 +1,82 @@
+name: Vanta merge justification
+
+# Native branch rules are the enforcement boundary. Free-text exception evidence
+# must never turn this check green without an independent human approval.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Do not check out or execute PR code with this token. All PR text stays data.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+            const author = pr.user.login.toLowerCase();
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number, per_page: 100,
+            });
+
+            // Keep each reviewer's latest decision. A later comment does not
+            // revoke an approval, but a dismissal or requested change does.
+            const latest = new Map();
+            for (const review of [...reviews].sort((a, b) => a.id - b.id)) {
+              if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state)
+                  && review.user?.login) {
+                latest.set(review.user.login.toLowerCase(), review);
+              }
+            }
+            let approver;
+            for (const [login, review] of latest) {
+              if (login === author || review.user.type !== 'User'
+                  || review.state !== 'APPROVED' || review.commit_id !== pr.head.sha) continue;
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({
+                owner, repo, username: review.user.login,
+              });
+              if (['write', 'maintain', 'admin'].includes(data.permission)) {
+                approver = review.user.login;
+                break;
+              }
+            }
+
+            if (approver) {
+              core.info(`Independent human approval for the current revision: @${approver}.`);
+              return;
+            }
+            if (!pr.merged) {
+              core.setFailed(
+                'An independent human with write access must approve the current revision. ' +
+                'An AI review, a stale approval, or text under Merge justification cannot replace approval. ' +
+                'For a stack, review each PR and confirm the final target before merging. ' +
+                'Policy exceptions require CTO approval and the authorised exception process.'
+              );
+              return;
+            }
+
+            // Preserve evidence after an exceptional merge; this does not grant
+            // or assert CTO approval, and cannot repair missing pre-merge review.
+            const match = (pr.body || '').match(/^##[ \t]+Merge justification[^\S\r\n]*\r?\n([\s\S]*?)(?=^#{1,2}[ \t]+|$(?![\s\S]))/im);
+            const text = (match ? match[1] : '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .split(/\r?\n/)
+              .filter(line => !/generated (?:with|by)|co-authored-by:/i.test(line))
+              .join('\n').trim();
+            const body = [
+              '**Vanta — unreviewed code change record**', '',
+              `Merged by @${pr.merged_by?.login ?? 'unknown'} at ${pr.merged_at} without a current independent human approval.`, '',
+              '**Exception text supplied (not verified as CTO-approved):**', '',
+              text ? `> ${text.replace(/\n/g, '\n> ')}` : '> _None recorded; AI credits and template comments are not exception evidence._', '',
+              'The control owner must investigate branch enforcement and verify any exception approval and Vanta evidence.',
+            ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body });
