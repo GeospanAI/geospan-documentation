@@ -1,0 +1,153 @@
+name: CI
+
+# Automated checks for every pull request. Satisfies the Vanta test
+# "GitHub code changes has automated checks enabled".
+#
+# This workflow auto-detects what is in the repository and checks it. It HARD
+# FAILS only on things that are unambiguously broken (syntax errors, failing
+# tests, malformed notebooks). Lint and build steps are advisory so that turning
+# this on cannot block merges on pre-existing style issues. To promote a step to
+# blocking, delete its `continue-on-error: true` line.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect project types
+        id: detect
+        run: |
+          set -eu
+          found() { find . -path ./.git -prune -o -name "$1" -print -quit | grep -q . && echo true || echo false; }
+          py=false
+          if [ "$(found '*.py')" = true ] || [ -f pyproject.toml ] || [ -f requirements.txt ]; then py=true; fi
+          {
+            echo "python=$py"
+            echo "node=$( [ -f package.json ] && echo true || echo false )"
+            echo "shell=$(found '*.sh')"
+            echo "notebook=$(found '*.ipynb')"
+          } >> "$GITHUB_OUTPUT"
+          echo "--- detected ---"; cat "$GITHUB_OUTPUT"
+
+      # ---------- Python ----------
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.python == 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Python - syntax check (blocking)
+        if: steps.detect.outputs.python == 'true'
+        run: python -m compileall -q . -x '[.]git|node_modules|[.]venv|venv'
+
+      - name: Python - lint (advisory)
+        if: steps.detect.outputs.python == 'true'
+        continue-on-error: true
+        run: |
+          pip install --quiet ruff
+          ruff check . || true
+          ruff format --check . || true
+
+      - name: Python - tests (blocking on real failures)
+        if: steps.detect.outputs.python == 'true'
+        env:
+          PYTHONPATH: .
+        run: |
+          set -eu
+          if ! find . -path ./.git -prune -o -name 'test_*.py' -print -o -name '*_test.py' -print | grep -q .; then
+            echo "No Python tests found - skipping."
+            exit 0
+          fi
+          pip install --quiet pytest
+          for req in requirements.txt requirements-*.txt; do
+            [ -f "$req" ] || continue
+            echo "installing $req"
+            pip install --quiet -r "$req"
+          done
+          if [ -f pyproject.toml ] || [ -f setup.py ]; then
+            pip install --quiet -e .
+          fi
+          set +e
+          pytest -q
+          rc=$?
+          set -e
+          case "$rc" in
+            0) echo "All tests passed." ;;
+            *) echo "::error::pytest failed or could not validate the discovered tests (exit $rc)."; exit "$rc" ;;
+          esac
+
+      # ---------- Node ----------
+      - name: Node - resolve version
+        id: nodever
+        if: steps.detect.outputs.node == 'true'
+        run: |
+          if [ -f .nvmrc ]; then v=$(tr -cd '0-9.' < .nvmrc); fi
+          v=${v:-20}
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "using Node $v"
+
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.node == 'true'
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+
+      - name: Node - install (advisory)
+        if: steps.detect.outputs.node == 'true'
+        continue-on-error: true
+        run: npm ci || npm install
+
+      - name: Node - lint (advisory)
+        if: steps.detect.outputs.node == 'true'
+        continue-on-error: true
+        run: npm run lint --if-present
+
+      - name: Node - build (advisory)
+        if: steps.detect.outputs.node == 'true'
+        continue-on-error: true
+        run: npm run build --if-present
+
+      - name: Node - tests (blocking if defined)
+        if: steps.detect.outputs.node == 'true'
+        run: npm test --if-present
+
+      # ---------- Shell ----------
+      - name: Shell - syntax check (blocking)
+        if: steps.detect.outputs.shell == 'true'
+        run: |
+          find . -path ./.git -prune -o -name '*.sh' -print | while read -r f; do
+            echo "checking $f"
+            bash -n "$f"
+          done
+
+      # ---------- Notebooks ----------
+      - name: Notebooks - validate (blocking)
+        if: steps.detect.outputs.notebook == 'true'
+        run: |
+          python - <<'PYEOF'
+          import json, pathlib, sys
+          bad = []
+          for p in pathlib.Path('.').rglob('*.ipynb'):
+              if '.git' in p.parts:
+                  continue
+              try:
+                  nb = json.loads(p.read_text(encoding='utf-8'))
+                  assert 'cells' in nb, 'missing "cells" key'
+              except Exception as e:
+                  bad.append('%s: %s' % (p, e))
+          if bad:
+              print('Malformed notebooks:')
+              for b in bad:
+                  print(' -', b)
+              sys.exit(1)
+          print('All notebooks parsed successfully.')
+          PYEOF
+
+      - name: Summary
+        run: echo "Automated checks completed for this pull request."

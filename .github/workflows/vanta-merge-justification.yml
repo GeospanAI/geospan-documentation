@@ -1,0 +1,130 @@
+name: Vanta merge justification
+
+# Native branch rules are the enforcement boundary. Only the two named founders
+# may record a revision-bound review exception on Development/Staging; never Production.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened, ready_for_review, closed]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # Do not check out or execute PR code with this token. All PR text stays data.
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const pull_number = context.payload.pull_request.number;
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+            const author = pr.user.login.toLowerCase();
+            const founders = new Map([
+              [227131098, { login: 'beaugeospan', role: 'CTO' }],
+              [230599793, { login: 'juliageospan', role: 'CEO' }],
+            ]);
+            const nonProduction = new Set(['development', 'Development', 'staging', 'Staging']);
+            const founderIdentity = user => {
+              const identity = founders.get(user?.id);
+              return user?.type === 'User' && identity?.login === user.login.toLowerCase() ? identity : null;
+            };
+            const permissions = new Map();
+            async function canReview(login) {
+              const key = login.toLowerCase();
+              if (!permissions.has(key)) {
+                const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner, repo, username: login });
+                permissions.set(key, ['write', 'maintain', 'admin'].includes(data.permission));
+              }
+              return permissions.get(key);
+            }
+            const reviews = await github.paginate(github.rest.pulls.listReviews, { owner, repo, pull_number, per_page: 100 });
+            const latest = new Map();
+            for (const review of [...reviews].sort((a, b) => a.id - b.id)) {
+              if (['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(review.state) && review.user?.login) {
+                latest.set(review.user.login.toLowerCase(), review);
+              }
+            }
+
+            // A blocking decision remains relevant after a new push, until resolved by the
+            // reviewer. Neither a second approval nor a founder exception overrides it.
+            let blockingReviewer;
+            for (const [login, review] of latest) {
+              if (login !== author && review.user.type === 'User' && review.state === 'CHANGES_REQUESTED'
+                  && await canReview(review.user.login)) {
+                blockingReviewer = review.user.login;
+                break;
+              }
+            }
+            let approver;
+            if (!blockingReviewer) {
+              for (const [login, review] of latest) {
+                if (login !== author && review.user.type === 'User' && review.state === 'APPROVED'
+                    && review.commit_id === pr.head.sha && await canReview(review.user.login)) {
+                  approver = review.user.login;
+                  break;
+                }
+              }
+            }
+
+            const match = (pr.body || '').match(/^##[ \t]+Merge justification[^\S\r\n]*\r?\n([\s\S]*?)(?=^#{1,2}[ \t]+|$(?![\s\S]))/im);
+            const text = (match ? match[1] : '')
+              .replace(/<!--[\s\S]*?-->/g, '')
+              .split(/\r?\n/)
+              .filter(line => !/generated (?:with|by)|co-authored-by:/i.test(line))
+              .join('\n').trim();
+            const fields = new Map();
+            for (const field of text.matchAll(/^\*\*([^*\n]+):\*\*[ \t]*([\s\S]*?)(?=^\*\*[^*\n]+:\*\*|$(?![\s\S]))/gm)) {
+              fields.set(field[1].trim().toLowerCase(), field[2].trim());
+            }
+            const identity = founderIdentity(pr.user);
+            const authorisedBy = fields.get('exception authorised by') || '';
+            const authLogin = (authorisedBy.match(/^@([a-z0-9-]+)\b/i)?.[1] || '').toLowerCase();
+            const authDate = authorisedBy.match(/\b\d{4}-\d{2}-\d{2}\b/)?.[0];
+            const validDate = authDate && !Number.isNaN(Date.parse(authDate))
+              && new Date(authDate).toISOString().slice(0, 10) === authDate;
+            const revision = (fields.get('revision') || '').replace(/`/g, '').trim().toLowerCase();
+            const meaningful = value => (value || '').replace(/[^\p{L}\p{N}]/gu, '').length >= 40;
+            const validRecord = identity && authLogin === identity.login && validDate
+              && /^[a-f0-9]{40}$/.test(revision) && revision === pr.head.sha.toLowerCase()
+              && meaningful(fields.get('reason and urgency') || fields.get('reason'))
+              && meaningful(fields.get('alternative validation') || fields.get('validation'))
+              && meaningful(fields.get('risk, owner and follow-up') || fields.get('risk and follow-up'));
+            const exception = !blockingReviewer && nonProduction.has(pr.base?.ref) && validRecord
+              && await canReview(pr.user.login);
+
+            if (!pr.merged) {
+              if (blockingReviewer) {
+                core.setFailed(`Resolve the blocking changes requested by @${blockingReviewer} before merging; exceptions cannot override blocking feedback.`);
+              } else if (approver) {
+                core.info(`Independent human approval for the current revision: @${approver}.`);
+              } else if (exception) {
+                core.info(`${identity.role} exception recorded for @${identity.login}, ${pr.head.sha}, into ${pr.base.ref}. Native CI and conversation rules still apply.`);
+              } else {
+                core.setFailed(
+                  'An independent human with write access must approve the current revision. ' +
+                  'Only beaugeospan (CTO) or juliageospan (CEO), on their own Development/Staging PR, may instead record a substantive Merge justification ' +
+                  'with Exception authorised by (@account and YYYY-MM-DD), Revision (full current head SHA), Reason and urgency, Alternative validation, and Risk, owner and follow-up. ' +
+                  'Production/default main never accepts this exception. AI credits, stale records and other accounts cannot replace approval.'
+                );
+              }
+              return;
+            }
+            if (approver) return;
+
+            // Record exceptions after merge without inventing an independent review.
+            const authorisedMerger = exception && founderIdentity(pr.merged_by);
+            const body = [
+              authorisedMerger ? '**Vanta — founder review exception record**' : '**Vanta — unreviewed code change record**', '',
+              `Merged by @${pr.merged_by?.login ?? 'unknown'} at ${pr.merged_at} without a current independent human approval.`, '',
+              authorisedMerger ? `**${identity.role} exception validated for @${identity.login}, revision ${pr.head.sha}, target ${pr.base.ref}.**`
+                : '**Exception text supplied (not verified as CTO-approved):**', '',
+              text ? `> ${text.replace(/\n/g, '\n> ')}` : '> _None recorded; AI credits and template comments are not exception evidence._', '',
+              blockingReviewer ? `Blocking feedback from @${blockingReviewer} was still present; investigate this merge.` : '',
+              'The control owner must verify the exception evidence, effective branch rules and Vanta sync.',
+            ].join('\n');
+            await github.rest.issues.createComment({ owner, repo, issue_number: pull_number, body });
