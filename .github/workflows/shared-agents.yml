@@ -1,0 +1,31 @@
+name: Shared agent configuration
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shared-agents:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          persist-credentials: false
+      - name: Validate the pinned submodule and root instructions
+        shell: bash
+        run: |
+          set -euo pipefail
+          entry=$(git ls-files --stage -- .agents)
+          [[ $(wc -l <<< "$entry") -eq 1 ]]
+          read -r mode revision stage path <<< "$entry"
+          [[ "$mode" == 160000 && "$stage" == 0 && "$path" == .agents ]]
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]]
+          [[ $(git config -f .gitmodules --get submodule..agents.path) == .agents ]]
+          [[ $(git config -f .gitmodules --get submodule..agents.url) == https://github.com/GeospanAI/.agents.git ]]
+          [[ $(git config -f .gitmodules --get submodule..agents.branch) == Production ]]
+          grep -Fq '.agents/shared/orchestrator.md' AGENTS.md
+          echo 'Shared agent configuration is valid; no private submodule fetch is needed.'
