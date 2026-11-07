@@ -1,0 +1,4 @@
+[submodule ".agents"]
+	path = .agents
+	url = https://github.com/GeospanAI/.agents.git
+	branch = Production
